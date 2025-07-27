@@ -1,13 +1,13 @@
 import os
 import tempfile
-import json # To parse credentials_json
+import json
 from flask import Flask, render_template, request, session, redirect, url_for, flash
 from werkzeug.utils import secure_filename
 import openai
-from google.oauth2.credentials import Credentials # Import Credentials class
-from google.auth.transport.requests import Request # Import Request for token refresh
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from gmail_utils import (
-    get_gmail_service_flow, get_gmail_credentials_from_callback, # New OAuth functions
+    get_gmail_service_flow, get_gmail_credentials_from_callback,
     get_gmail_service, list_messages, get_message_payload,
     classify_message, modify_message_labels,
     parse_unsubscribe_links, send_message
@@ -20,9 +20,8 @@ UPLOAD_FOLDER = tempfile.gettempdir()
 ALLOWED_EXTENSIONS = {'json'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-EMAILS_PER_PAGE = 45 # As per your request
+EMAILS_PER_PAGE = 45
 
-# Define the OAuth callback route
 OAUTH_CALLBACK_PATH = '/oauth2callback'
 
 def allowed_file(filename):
@@ -47,15 +46,12 @@ def index():
     except ValueError:
         page = 1
 
-    # Initialize pagination tokens and Gmail credentials in session
     if 'page_tokens' not in session:
         session['page_tokens'] = [None]
     if 'gmail_credentials_data' not in session:
         session['gmail_credentials_data'] = None
 
     if request.method == 'POST':
-        # Handle form submission and credential upload
-        # Read the file content as a string
         credentials_file = request.files.get('credentials')
         if not credentials_file or credentials_file.filename == '':
             flash('Google credentials.json file is required!', 'danger')
@@ -65,12 +61,9 @@ def index():
             flash('Invalid file. Please upload a valid credentials.json', 'danger')
             return redirect(request.url)
 
-        # Store credentials JSON data (as string) in session
-        # This is temporary and will be cleared once flow is complete or session expires
         credentials_data = credentials_file.read().decode('utf-8')
         session['uploaded_credentials_json_data'] = credentials_data
 
-        # Save other form inputs to session
         session['openai_key'] = request.form.get('openai_key', '').strip()
         session['summary_email'] = request.form.get('summary_email', '').strip()
         vip_input = request.form.get('vip_senders', '')
@@ -78,10 +71,8 @@ def index():
         keywords_input = request.form.get('keywords', '')
         session['keywords'] = [k.strip() for k in keywords_input.split(',') if k.strip()]
 
-        # Validate required inputs
         if not session['openai_key'] or not session['summary_email']:
             flash('OpenAI API key and Summary Email are required!', 'danger')
-            # Repopulate form_data before rendering
             form_data['openai_key'] = session['openai_key']
             form_data['summary_email'] = session['summary_email']
             form_data['vip_senders'] = vip_input
@@ -89,23 +80,20 @@ def index():
             return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
                                    filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
 
-        # Construct the redirect URI for the OAuth flow
-        # Use request.url_root for the base URL, which works for both local and Render
         redirect_uri = request.url_root.rstrip('/') + OAUTH_CALLBACK_PATH
 
         try:
-            # Initiate the OAuth flow
+            # flow_state now contains 'client_secrets_dict'
             authorization_url, flow_state = get_gmail_service_flow(credentials_data, redirect_uri)
-            session['gmail_oauth_flow_state'] = flow_state # Store the flow state for callback
-            session['page_tokens'] = [None] # Reset pagination tokens on new run
-            session['gmail_credentials_data'] = None # Clear old creds
+            session['gmail_oauth_flow_state'] = flow_state
+            session['page_tokens'] = [None]
+            session['gmail_credentials_data'] = None
 
             flash('Redirecting to Google for authentication...', 'info')
-            return redirect(authorization_url) # Redirect user to Google for authorization
+            return redirect(authorization_url)
 
         except Exception as e:
             flash(f'Error initiating Google authentication: {str(e)}. Make sure your credentials.json is for "Web application" type and redirect URIs are configured correctly.', 'danger')
-            # Repopulate form_data on error
             form_data['openai_key'] = session['openai_key']
             form_data['summary_email'] = session['summary_email']
             form_data['vip_senders'] = vip_input
@@ -113,14 +101,11 @@ def index():
             return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
                                    filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
 
-    # For GET requests:
-    # 1. Repopulate form data from session
     form_data['openai_key'] = session.get('openai_key', '')
     form_data['summary_email'] = session.get('summary_email', '')
     form_data['vip_senders'] = ', '.join(session.get('vip_senders', []))
     form_data['keywords'] = ', '.join(session.get('keywords', []))
 
-    # 2. Check if Gmail credentials are authenticated
     if session.get('gmail_credentials_data') is None:
         flash('Please upload your Google credentials.json (Web Application type) and provide OpenAI API key to start.', 'info')
         return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
@@ -131,17 +116,14 @@ def index():
         creds_json = json.loads(session['gmail_credentials_data'])
         creds = Credentials.from_authorized_user_info(creds_json, SCOPES)
 
-        # Refresh token if expired
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            # Save updated credentials back to session
             session['gmail_credentials_data'] = creds.to_json()
             session.modified = True
 
         service = get_gmail_service(creds)
         openai.api_key = session.get('openai_key', '')
 
-        # Build query for Gmail API based on keywords if any
         keywords = session.get('keywords', [])
         query_string = None
         if keywords:
@@ -153,13 +135,10 @@ def index():
 
         label_ids = None if query_string else ['INBOX']
 
-        # Determine the page token to use for the current request
         current_page_token = None
         if page > 1 and page <= len(session['page_tokens']):
             current_page_token = session['page_tokens'][page - 1]
         elif page > len(session['page_tokens']):
-            # If user tries to jump to a page whose token we don't have yet,
-            # we try to fetch from the last known token.
             current_page_token = session['page_tokens'][-1]
 
 
@@ -180,7 +159,6 @@ def index():
                                    filter_priority=filter_priority, page=page,
                                    has_next=has_next, has_prev=has_prev)
 
-        # Update page_tokens list if we've moved to a new 'next' page
         if next_gmail_page_token and (page + 1) > len(session['page_tokens']):
             session['page_tokens'].append(next_gmail_page_token)
             session.modified = True
@@ -245,10 +223,6 @@ def index():
 
 @app.route(OAUTH_CALLBACK_PATH)
 def oauth2callback():
-    """
-    Handles the redirect from Google after user authorization.
-    Exchanges the authorization code for access tokens.
-    """
     state = request.args.get('state')
     code = request.args.get('code')
     error = request.args.get('error')
@@ -257,20 +231,22 @@ def oauth2callback():
         flash(f'Google OAuth Error: {error}', 'danger')
         return redirect(url_for('index'))
 
-    if 'gmail_oauth_flow_state' not in session or session['gmail_oauth_flow_state']['state'] != state:
+    # Retrieve stored flow state from session
+    stored_flow_state = session.pop('gmail_oauth_flow_state', None) # Pop to clear after use
+
+    if stored_flow_state is None or stored_flow_state['state'] != state:
         flash('OAuth state mismatch or session expired. Please try again.', 'danger')
         return redirect(url_for('index'))
 
     try:
-        # Reconstruct the flow and fetch tokens
+        # Pass the retrieved flow state to get_gmail_credentials_from_callback
         credentials = get_gmail_credentials_from_callback(
-            session.pop('gmail_oauth_flow_state'), # Pop to clear state after use
-            request.url # Pass the full URL (contains code and state)
+            stored_flow_state, # This now correctly contains 'client_secrets_dict'
+            request.url
         )
 
-        # Store the serialized credentials (including refresh token) in the session
         session['gmail_credentials_data'] = credentials.to_json()
-        session.modified = True # Crucial for Flask to save changes to session
+        session.modified = True
 
         flash('Successfully authenticated with Google!', 'success')
         return redirect(url_for('index', filter=request.args.get('filter', 'all'), page=1))
