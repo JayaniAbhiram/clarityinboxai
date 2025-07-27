@@ -2,7 +2,7 @@ import os
 import base64
 import re
 import tempfile
-import json
+import json # Ensure json is imported
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -11,11 +11,14 @@ from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
+# Removed global oauth_flow_instance
+
 def get_gmail_service_flow(credentials_json_data, redirect_uri):
     """
     Initializes the OAuth flow for a web application.
     Returns the authorization URL and the state string.
     """
+    # Create a temporary file to store credentials.json data for Flow.from_client_secrets_file
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
         temp_cred_file.write(credentials_json_data)
         temp_cred_file_path = temp_cred_file.name
@@ -23,61 +26,38 @@ def get_gmail_service_flow(credentials_json_data, redirect_uri):
     flow = Flow.from_client_secrets_file(temp_cred_file_path, SCOPES)
     flow.redirect_uri = redirect_uri
 
-    os.remove(temp_cred_file_path) # Delete temp file immediately
+    # Delete the temporary file immediately
+    os.remove(temp_cred_file_path)
 
     authorization_url, state = flow.authorization_url(
         access_type='offline',  # Request a refresh token
         include_granted_scopes='true'
     )
     
+    # We only need to store the 'state' string in the session for the callback,
+    # and the raw credentials data for re-initializing the flow later.
     return authorization_url, state
 
 def get_gmail_credentials_from_callback(credentials_json_data, redirect_uri, authorization_response):
     """
     Exchanges the authorization code for credentials by re-initializing the Flow.
     """
+    # Re-create a temporary file from the stored credentials_json_data string
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
         temp_cred_file.write(credentials_json_data)
         temp_cred_file_path = temp_cred_file.name
 
+    # Re-initialize the Flow object using the temp file
     flow = Flow.from_client_secrets_file(temp_cred_file_path, SCOPES)
     flow.redirect_uri = redirect_uri
 
+    # Delete the temporary file immediately
     os.remove(temp_cred_file_path)
 
+    # Fetch tokens using the authorization response
     flow.fetch_token(authorization_response=authorization_response)
-    
-    # CRITICAL: Print the refresh token for manual copy
-    print(f"--- IMPORTANT: Copy this refresh token and set it as GOOGLE_REFRESH_TOKEN env var in Render ---")
-    print(f"REFRESH_TOKEN_FOR_RENDER_ENV: {flow.credentials.refresh_token}")
-    print(f"-------------------------------------------------------------------------------------------------")
 
     return flow.credentials
-
-def get_credentials_from_refresh_token(refresh_token, credentials_json_data):
-    """
-    Rebuilds credentials using a stored refresh token and client secrets.
-    """
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
-        temp_cred_file.write(credentials_json_data)
-        temp_cred_file_path = temp_cred_file.name
-
-    # Load client config from file
-    client_config = json.loads(credentials_json_data)['web'] # Assuming 'web' client
-
-    creds = Credentials.from_authorized_user_info(
-        info={
-            'client_id': client_config['client_id'],
-            'client_secret': client_config['client_secret'],
-            'refresh_token': refresh_token,
-            'token_uri': client_config['token_uri'],
-            'scopes': SCOPES # Ensure scopes are included here
-        },
-        scopes=SCOPES
-    )
-    os.remove(temp_cred_file_path)
-    return creds
-
 
 def get_gmail_service(credentials):
     """
