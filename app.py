@@ -1,22 +1,29 @@
 import os
 import tempfile
+import json # To parse credentials_json
 from flask import Flask, render_template, request, session, redirect, url_for, flash
 from werkzeug.utils import secure_filename
 import openai
+from google.oauth2.credentials import Credentials # Import Credentials class
+from google.auth.transport.requests import Request # Import Request for token refresh
 from gmail_utils import (
+    get_gmail_service_flow, get_gmail_credentials_from_callback, # New OAuth functions
     get_gmail_service, list_messages, get_message_payload,
     classify_message, modify_message_labels,
     parse_unsubscribe_links, send_message
 )
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # Replace with your own secure secret key for production
+app.secret_key = os.urandom(24) # Ensure this is a strong, random key in production
 
 UPLOAD_FOLDER = tempfile.gettempdir()
 ALLOWED_EXTENSIONS = {'json'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-EMAILS_PER_PAGE = 45
+EMAILS_PER_PAGE = 45 # As per your request
+
+# Define the OAuth callback route
+OAUTH_CALLBACK_PATH = '/oauth2callback'
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -24,7 +31,6 @@ def allowed_file(filename):
 @app.route('/', methods=['GET', 'POST'])
 def index():
     emails, logs = [], []
-    # Default form data
     form_data = {
         'openai_key': '',
         'summary_email': '',
@@ -32,7 +38,6 @@ def index():
         'keywords': ''
     }
 
-    # Retrieve filter and page from query parameters
     filter_priority = request.args.get('filter', 'all').lower()
     page = request.args.get('page', 1)
     try:
@@ -42,84 +47,101 @@ def index():
     except ValueError:
         page = 1
 
-    # Initialize pagination tokens list in session if not present
+    # Initialize pagination tokens and Gmail credentials in session
     if 'page_tokens' not in session:
-        session['page_tokens'] = [None] # First element is always None for the initial page
+        session['page_tokens'] = [None]
+    if 'gmail_credentials_data' not in session:
+        session['gmail_credentials_data'] = None
 
     if request.method == 'POST':
-        # Handle file upload and form data submission
-        if 'credentials' not in request.files:
+        # Handle form submission and credential upload
+        # Read the file content as a string
+        credentials_file = request.files.get('credentials')
+        if not credentials_file or credentials_file.filename == '':
             flash('Google credentials.json file is required!', 'danger')
             return redirect(request.url)
 
-        file = request.files['credentials']
-        if file.filename == '':
-            flash('No file selected for credentials.json!', 'danger')
-            return redirect(request.url)
-
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            cred_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(cred_path)
-            session['credentials_json'] = cred_path
-
-            # Delete old token.json to force re-authentication with new credentials
-            token_path = os.path.join(tempfile.gettempdir(), 'token.json')
-            if os.path.exists(token_path):
-                os.remove(token_path)
-
-            # Clear page tokens when new credentials are uploaded or run is initiated
-            session['page_tokens'] = [None]
-            page = 1 # Reset to first page
-            flash('Credentials uploaded and session reset. Running email processing...', 'success')
-
-        else:
+        if not allowed_file(credentials_file.filename):
             flash('Invalid file. Please upload a valid credentials.json', 'danger')
             return redirect(request.url)
 
-        # Save other inputs to session for persistence
+        # Store credentials JSON data (as string) in session
+        # This is temporary and will be cleared once flow is complete or session expires
+        credentials_data = credentials_file.read().decode('utf-8')
+        session['uploaded_credentials_json_data'] = credentials_data
+
+        # Save other form inputs to session
         session['openai_key'] = request.form.get('openai_key', '').strip()
         session['summary_email'] = request.form.get('summary_email', '').strip()
-
         vip_input = request.form.get('vip_senders', '')
         session['vip_senders'] = [v.strip() for v in vip_input.split(',') if v.strip()]
-
         keywords_input = request.form.get('keywords', '')
         session['keywords'] = [k.strip() for k in keywords_input.split(',') if k.strip()]
 
-        # Save form inputs to repopulate form after POST
-        form_data['openai_key'] = session['openai_key']
-        form_data['summary_email'] = session['summary_email']
-        form_data['vip_senders'] = vip_input
-        form_data['keywords'] = keywords_input
-
+        # Validate required inputs
         if not session['openai_key'] or not session['summary_email']:
             flash('OpenAI API key and Summary Email are required!', 'danger')
+            # Repopulate form_data before rendering
+            form_data['openai_key'] = session['openai_key']
+            form_data['summary_email'] = session['summary_email']
+            form_data['vip_senders'] = vip_input
+            form_data['keywords'] = keywords_input
             return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
-                                   filter_priority=filter_priority, page=page,
-                                   has_next=False, has_prev=False)
+                                   filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
 
-        # Redirect to GET request to process emails and display results
-        return redirect(url_for('index', filter=filter_priority, page=page))
+        # Construct the redirect URI for the OAuth flow
+        # Use request.url_root for the base URL, which works for both local and Render
+        redirect_uri = request.url_root.rstrip('/') + OAUTH_CALLBACK_PATH
 
-    # For GET requests (initial load or after POST redirect)
-    # Populate form data from session
+        try:
+            # Initiate the OAuth flow
+            authorization_url, flow_state = get_gmail_service_flow(credentials_data, redirect_uri)
+            session['gmail_oauth_flow_state'] = flow_state # Store the flow state for callback
+            session['page_tokens'] = [None] # Reset pagination tokens on new run
+            session['gmail_credentials_data'] = None # Clear old creds
+
+            flash('Redirecting to Google for authentication...', 'info')
+            return redirect(authorization_url) # Redirect user to Google for authorization
+
+        except Exception as e:
+            flash(f'Error initiating Google authentication: {str(e)}. Make sure your credentials.json is for "Web application" type and redirect URIs are configured correctly.', 'danger')
+            # Repopulate form_data on error
+            form_data['openai_key'] = session['openai_key']
+            form_data['summary_email'] = session['summary_email']
+            form_data['vip_senders'] = vip_input
+            form_data['keywords'] = keywords_input
+            return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
+                                   filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
+
+    # For GET requests:
+    # 1. Repopulate form data from session
     form_data['openai_key'] = session.get('openai_key', '')
     form_data['summary_email'] = session.get('summary_email', '')
     form_data['vip_senders'] = ', '.join(session.get('vip_senders', []))
     form_data['keywords'] = ', '.join(session.get('keywords', []))
 
-    if 'credentials_json' not in session:
-        # Credentials not uploaded yet, just render empty page
-        flash('Please upload your Google credentials.json and provide OpenAI API key to start.', 'info')
+    # 2. Check if Gmail credentials are authenticated
+    if session.get('gmail_credentials_data') is None:
+        flash('Please upload your Google credentials.json (Web Application type) and provide OpenAI API key to start.', 'info')
         return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
-                               filter_priority=filter_priority, page=page,
-                               has_next=False, has_prev=False)
+                               filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
 
     try:
-        openai.api_key = session.get('openai_key', '')
-        service = get_gmail_service(session['credentials_json'])
+        # Reconstruct credentials from stored data (JSON string -> Credentials object)
+        creds_json = json.loads(session['gmail_credentials_data'])
+        creds = Credentials.from_authorized_user_info(creds_json, SCOPES)
 
+        # Refresh token if expired
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save updated credentials back to session
+            session['gmail_credentials_data'] = creds.to_json()
+            session.modified = True
+
+        service = get_gmail_service(creds)
+        openai.api_key = session.get('openai_key', '')
+
+        # Build query for Gmail API based on keywords if any
         keywords = session.get('keywords', [])
         query_string = None
         if keywords:
@@ -136,15 +158,11 @@ def index():
         if page > 1 and page <= len(session['page_tokens']):
             current_page_token = session['page_tokens'][page - 1]
         elif page > len(session['page_tokens']):
-            # This handles cases where user tries to jump too far ahead or
-            # directly accesses a page beyond what we've fetched.
-            # We'll just try to fetch the next available token.
-            # This might require fetching previous pages internally to get the token.
-            # For simplicity, if we don't have the token, we'll try to get it.
-            # A more robust solution for arbitrary page jumps might be needed for very large datasets.
-            current_page_token = session['page_tokens'][-1] # Use the last known token to fetch more
+            # If user tries to jump to a page whose token we don't have yet,
+            # we try to fetch from the last known token.
+            current_page_token = session['page_tokens'][-1]
 
-        # Fetch messages for the current page using Gmail's pageToken
+
         messages, next_gmail_page_token = list_messages(
             service,
             max_results=EMAILS_PER_PAGE,
@@ -164,22 +182,18 @@ def index():
 
         # Update page_tokens list if we've moved to a new 'next' page
         if next_gmail_page_token and (page + 1) > len(session['page_tokens']):
-            # If we're on page 'N' and we get a token for 'N+1', add it.
             session['page_tokens'].append(next_gmail_page_token)
-            session.modified = True # Important for Flask sessions when modifying a mutable object
+            session.modified = True
 
-        # Process messages
         detailed_emails = []
         for msg in messages:
             subject, sender, snippet, body, _ = get_message_payload(service, msg['id'])
             priority = classify_message(subject, sender, body, session.get('vip_senders', []), keywords or [])
 
-            # Modify labels accordingly (ensure 'IMPORTANT' label exists in Gmail or handle error)
             try:
                 if priority == 'high':
                     modify_message_labels(service, msg['id'], labels_to_add=['IMPORTANT'])
                 else:
-                    # Only try to remove if it's currently marked as IMPORTANT to avoid API errors
                     modify_message_labels(service, msg['id'], labels_to_remove=['IMPORTANT'])
             except Exception as label_err:
                 logs.append(f"Warning: Could not modify labels for message {msg['id']}: {label_err}")
@@ -197,37 +211,22 @@ def index():
                 'gmail_url': gmail_url
             })
 
-        # Filter by priority dropdown (only apply to the 20 messages fetched for the current page)
         if filter_priority in ('high', 'normal'):
             emails = [e for e in detailed_emails if e['priority'] == filter_priority]
         else:
             emails = detailed_emails
 
-        # Determine pagination buttons visibility based on Gmail's nextPageToken
         has_prev = page > 1
-        has_next = bool(next_gmail_page_token) # If next_gmail_page_token exists, there's a next page
-
-        # If after filtering, we have no emails, and we know there's a next page from Gmail API
-        # but our current page is empty due to filter, we might need a more complex redirect
-        # For simplicity, we'll just show what we have.
-
-        # If the number of filtered emails is less than EMAILS_PER_PAGE, it means
-        # there are no more "next" pages for this filter from the current API token.
-        # This is a nuance because Gmail API's next page token refers to the overall list,
-        # not necessarily the filtered list.
-        # For true filtered pagination, you might need to fetch more and apply filter until you fill the page,
-        # or rely entirely on Gmail's 'q' parameter if it supports your specific filter logic.
-        # For now, `has_next` purely reflects Gmail's `nextPageToken`.
+        has_next = bool(next_gmail_page_token)
 
         logs.append(f"Showing page {page} - {len(emails)} emails (filter: {filter_priority.capitalize()})")
         if next_gmail_page_token:
-            logs.append(f"Next Gmail page token received: {next_gmail_page_token[:10]}...") # Show a snippet
+            logs.append(f"Next Gmail page token received: {next_gmail_page_token[:10]}...")
 
     except openai.AuthenticationError:
         flash('Invalid OpenAI API Key. Please check your key.', 'danger')
-        logs = [] # Clear logs on auth error
+        logs = []
         emails = []
-        # Clear sensitive data but keep other form_data
         session.pop('openai_key', None)
         form_data['openai_key'] = ''
         has_next = False
@@ -242,6 +241,43 @@ def index():
     return render_template('index.html', emails=emails, logs=logs, form_data=form_data,
                            filter_priority=filter_priority, page=page,
                            has_next=has_next, has_prev=has_prev)
+
+
+@app.route(OAUTH_CALLBACK_PATH)
+def oauth2callback():
+    """
+    Handles the redirect from Google after user authorization.
+    Exchanges the authorization code for access tokens.
+    """
+    state = request.args.get('state')
+    code = request.args.get('code')
+    error = request.args.get('error')
+
+    if error:
+        flash(f'Google OAuth Error: {error}', 'danger')
+        return redirect(url_for('index'))
+
+    if 'gmail_oauth_flow_state' not in session or session['gmail_oauth_flow_state']['state'] != state:
+        flash('OAuth state mismatch or session expired. Please try again.', 'danger')
+        return redirect(url_for('index'))
+
+    try:
+        # Reconstruct the flow and fetch tokens
+        credentials = get_gmail_credentials_from_callback(
+            session.pop('gmail_oauth_flow_state'), # Pop to clear state after use
+            request.url # Pass the full URL (contains code and state)
+        )
+
+        # Store the serialized credentials (including refresh token) in the session
+        session['gmail_credentials_data'] = credentials.to_json()
+        session.modified = True # Crucial for Flask to save changes to session
+
+        flash('Successfully authenticated with Google!', 'success')
+        return redirect(url_for('index', filter=request.args.get('filter', 'all'), page=1))
+
+    except Exception as e:
+        flash(f'Error exchanging authorization code: {str(e)}', 'danger')
+        return redirect(url_for('index'))
 
 
 if __name__ == '__main__':
