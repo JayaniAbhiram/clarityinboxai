@@ -1,13 +1,7 @@
-import os
 import base64
 import re
-import tempfile
 from email.message import EmailMessage
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 def list_messages(service, max_results=20, label_ids=None, query=None, page_token=None):
     request_params = {
