@@ -11,7 +11,7 @@ from gmail_utils import (
     get_gmail_service, list_messages, get_message_payload,
     classify_message, modify_message_labels,
     parse_unsubscribe_links, send_message,
-    SCOPES
+    SCOPES # <--- Add this line
 )
 
 app = Flask(__name__)
