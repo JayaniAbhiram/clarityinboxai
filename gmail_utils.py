@@ -2,6 +2,7 @@ import os
 import base64
 import re
 import tempfile
+import json # Added import for json
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -10,55 +11,52 @@ from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
-# Define a global or pass it around if needed
-# This will temporarily store the Flow object for multi-step OAuth
-oauth_flow_instance = None
+# Removed global oauth_flow_instance as it's not needed with session management
 
 def get_gmail_service_flow(credentials_json_data, redirect_uri):
     """
     Initializes the OAuth flow for a web application.
-    Returns the authorization URL and the flow object (to be stored in session).
+    Returns the authorization URL and the state needed for callback (which includes the full client_secrets dict).
     """
-    global oauth_flow_instance # Declare intent to modify global variable
-    
     # Create a temporary file to store credentials.json data
-    # Render's ephemeral file system is fine here as we don't persist credentials.json
+    # This is safe as Render's file system is ephemeral and temporary files are deleted
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
         temp_cred_file.write(credentials_json_data)
         temp_cred_file_path = temp_cred_file.name
 
+    # Flow.from_client_secrets_file correctly parses the 'web' key from the temp file
     flow = Flow.from_client_secrets_file(temp_cred_file_path, SCOPES)
-    flow.redirect_uri = redirect_uri # Set the redirect URI from your Render URL
+    flow.redirect_uri = redirect_uri
 
-    # Delete the temporary file after creating the flow
+    # Delete the temporary file immediately after creating the flow object
     os.remove(temp_cred_file_path)
 
     authorization_url, state = flow.authorization_url(
         access_type='offline',  # Request a refresh token
         include_granted_scopes='true'
     )
-    
-    # Store the flow object in a pickleable format or its state
-    # We can't directly pickle 'flow' due to HTTP components.
-    # Instead, we store its client_config and state for reconstruction.
-    oauth_flow_instance = {
-        'client_config': flow.client_config,
-        'state': state,
-        'redirect_uri': redirect_uri # Also store redirect_uri
-    }
-    return authorization_url, oauth_flow_instance
 
-def get_gmail_credentials_from_callback(flow_state, authorization_response):
+    # CRITICAL CHANGE: Store the *full* client secrets dictionary (which includes the 'web' key)
+    # This is what Flow.from_client_config expects for reconstruction.
+    full_client_secrets_dict = flow.client_secrets
+
+    flow_state_to_store = {
+        'client_secrets_dict': full_client_secrets_dict, # Store the full dict here
+        'state': state,
+        'redirect_uri': redirect_uri
+    }
+    return authorization_url, flow_state_to_store
+
+def get_gmail_credentials_from_callback(flow_state_from_session, authorization_response):
     """
     Exchanges the authorization code for credentials.
     Reconstructs flow from state, then fetches tokens.
     """
-    flow = Flow.from_client_config(flow_state['client_config'], scopes=SCOPES)
-    flow.redirect_uri = flow_state['redirect_uri']
+    # Use the full client secrets dictionary stored in the session for reconstruction
+    flow = Flow.from_client_config(flow_state_from_session['client_secrets_dict'], scopes=SCOPES)
+    flow.redirect_uri = flow_state_from_session['redirect_uri']
     flow.fetch_token(authorization_response=authorization_response)
-    
-    # Store the refresh token persistently (e.g., in a database, not directly here)
-    # For now, we'll return the credentials and let app.py save them to token.json if desired.
+
     return flow.credentials
 
 def get_gmail_service(credentials):
