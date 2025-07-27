@@ -5,3 +5,5 @@ google-auth-oauthlib
 openai
 APScheduler
 gunicorn
+google-auth
+google-api-python-client
