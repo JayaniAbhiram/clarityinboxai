@@ -50,6 +50,10 @@ def index():
         session['page_tokens'] = [None]
     if 'gmail_credentials_data' not in session:
         session['gmail_credentials_data'] = None
+    # Ensure 'gmail_oauth_state' is initialized
+    if 'gmail_oauth_state' not in session:
+        session['gmail_oauth_state'] = None
+
 
     if request.method == 'POST':
         credentials_file = request.files.get('credentials')
@@ -62,6 +66,7 @@ def index():
             return redirect(request.url)
 
         credentials_data = credentials_file.read().decode('utf-8')
+        # Store the raw credentials JSON string in session
         session['uploaded_credentials_json_data'] = credentials_data
 
         session['openai_key'] = request.form.get('openai_key', '').strip()
@@ -83,9 +88,9 @@ def index():
         redirect_uri = request.url_root.rstrip('/') + OAUTH_CALLBACK_PATH
 
         try:
-            # flow_state now contains 'client_secrets_dict'
-            authorization_url, flow_state = get_gmail_service_flow(credentials_data, redirect_uri)
-            session['gmail_oauth_flow_state'] = flow_state
+            # get_gmail_service_flow now returns only authorization_url and state string
+            authorization_url, state = get_gmail_service_flow(credentials_data, redirect_uri)
+            session['gmail_oauth_state'] = state # Store only the state string
             session['page_tokens'] = [None]
             session['gmail_credentials_data'] = None
 
@@ -112,7 +117,6 @@ def index():
                                filter_priority=filter_priority, page=page, has_next=False, has_prev=False)
 
     try:
-        # Reconstruct credentials from stored data (JSON string -> Credentials object)
         creds_json = json.loads(session['gmail_credentials_data'])
         creds = Credentials.from_authorized_user_info(creds_json, SCOPES)
 
@@ -231,24 +235,30 @@ def oauth2callback():
         flash(f'Google OAuth Error: {error}', 'danger')
         return redirect(url_for('index'))
 
-    # Retrieve stored flow state from session
-    stored_flow_state = session.pop('gmail_oauth_flow_state', None) # Pop to clear after use
+    # Retrieve stored state and credentials data from session
+    stored_state = session.pop('gmail_oauth_state', None) # Pop to clear state after use
+    credentials_data_string = session.get('uploaded_credentials_json_data') # Get the raw JSON string
 
-    if stored_flow_state is None or stored_flow_state['state'] != state:
-        flash('OAuth state mismatch or session expired. Please try again.', 'danger')
+    if stored_state is None or stored_state != state or credentials_data_string is None:
+        flash('OAuth state mismatch, credentials data missing, or session expired. Please try again.', 'danger')
         return redirect(url_for('index'))
 
     try:
-        # Pass the retrieved flow state to get_gmail_credentials_from_callback
+        redirect_uri = request.url_root.rstrip('/') + OAUTH_CALLBACK_PATH
+        
+        # Pass the raw credentials data string and the full redirect_uri
         credentials = get_gmail_credentials_from_callback(
-            stored_flow_state, # This now correctly contains 'client_secrets_dict'
-            request.url
+            credentials_data_string,
+            redirect_uri,
+            request.url # This contains the authorization response
         )
 
         session['gmail_credentials_data'] = credentials.to_json()
         session.modified = True
 
         flash('Successfully authenticated with Google!', 'success')
+        # Remove uploaded_credentials_json_data after successful authentication
+        session.pop('uploaded_credentials_json_data', None)
         return redirect(url_for('index', filter=request.args.get('filter', 'all'), page=1))
 
     except Exception as e:
