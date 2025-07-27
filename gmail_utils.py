@@ -2,7 +2,7 @@ import os
 import base64
 import re
 import tempfile
-import json # Ensure json is imported
+import json
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -13,51 +13,76 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 # Removed global oauth_flow_instance
 
-def get_gmail_service_flow(credentials_json_data, redirect_uri):
+def get_gmail_service_flow(client_id, client_secret, redirect_uri): # Changed to accept id/secret directly
     """
-    Initializes the OAuth flow for a web application.
+    Initializes the OAuth flow for a web application using client ID and secret.
     Returns the authorization URL and the state string.
     """
-    # Create a temporary file to store credentials.json data for Flow.from_client_secrets_file
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
-        temp_cred_file.write(credentials_json_data)
-        temp_cred_file_path = temp_cred_file.name
-
-    flow = Flow.from_client_secrets_file(temp_cred_file_path, SCOPES)
+    # Build client_config dictionary directly
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "redirect_uris": [redirect_uri] # Only need the one being used
+        }
+    }
+    
+    flow = Flow.from_client_config(client_config, SCOPES) # Use from_client_config
     flow.redirect_uri = redirect_uri
-
-    # Delete the temporary file immediately
-    os.remove(temp_cred_file_path)
 
     authorization_url, state = flow.authorization_url(
         access_type='offline',  # Request a refresh token
         include_granted_scopes='true'
     )
     
-    # We only need to store the 'state' string in the session for the callback,
-    # and the raw credentials data for re-initializing the flow later.
     return authorization_url, state
 
-def get_gmail_credentials_from_callback(credentials_json_data, redirect_uri, authorization_response):
+def get_gmail_credentials_from_callback(client_id, client_secret, redirect_uri, authorization_response): # Changed to accept id/secret
     """
     Exchanges the authorization code for credentials by re-initializing the Flow.
     """
-    # Re-create a temporary file from the stored credentials_json_data string
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_cred_file:
-        temp_cred_file.write(credentials_json_data)
-        temp_cred_file_path = temp_cred_file.name
+    client_config = { # Rebuild client_config dictionary
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "redirect_uris": [redirect_uri]
+        }
+    }
 
-    # Re-initialize the Flow object using the temp file
-    flow = Flow.from_client_secrets_file(temp_cred_file_path, SCOPES)
+    flow = Flow.from_client_config(client_config, SCOPES)
     flow.redirect_uri = redirect_uri
 
-    # Delete the temporary file immediately
-    os.remove(temp_cred_file_path)
-
-    # Fetch tokens using the authorization response
     flow.fetch_token(authorization_response=authorization_response)
+    
+    # CRITICAL: Print client_id, client_secret, and refresh_token for manual copy
+    print(f"\n--- IMPORTANT: Copy these values and set them as Render Environment Variables ---")
+    print(f"GOOGLE_CLIENT_ID: {client_id}")
+    print(f"GOOGLE_CLIENT_SECRET: {client_secret}")
+    print(f"GOOGLE_REFRESH_TOKEN: {flow.credentials.refresh_token}")
+    print(f"---------------------------------------------------------------------------------\n")
 
     return flow.credentials
+
+def get_credentials_from_env_vars(client_id, client_secret, refresh_token): # New function for env vars
+    """
+    Rebuilds credentials from environment variables.
+    """
+    info = {
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'refresh_token': refresh_token,
+        'token_uri': "https://oauth2.googleapis.com/token", # Hardcode token_uri for simplicity
+        'scopes': SCOPES
+    }
+    creds = Credentials.from_authorized_user_info(info, SCOPES)
+    return creds
+
 
 def get_gmail_service(credentials):
     """
